@@ -3,20 +3,23 @@
 [![AUR](https://img.shields.io/aur/version/hyprexpose-git)](https://aur.archlinux.org/packages/hyprexpose-git)
 ![vibecoded](https://img.shields.io/badge/vibecoded-ff69b4?style=flat&logo=sparkles&logoColor=white)
 
-Lightweight workspace overview for [Hyprland](https://hyprland.org). Shows active workspaces with real window thumbnails, navigate with keyboard, press Enter to switch.
+Lightweight workspace overview for [Hyprland](https://hyprland.org) and [Sway](https://swaywm.org). Shows active workspaces with real window thumbnails, navigate with keyboard, press Enter to switch.
 
 > **Requires Hyprland >= 0.55** (uses the Lua-based IPC dispatch introduced in that release).
+
+> **Sway support:** the compositor is auto-detected at startup (via `SWAYSOCK`). Window thumbnails require the `hyprland-toplevel-export` protocol, which Sway doesn't implement — on Sway, windows are drawn as colored rectangles with their app id instead (same as `--no-preview`). Everything else (grid, keyboard/mouse navigation, switching, moving windows) works the same.
 
 ![Demo](demo.gif)
 
 ## Features
 
-- Real window thumbnails via hyprland-toplevel-export protocol
+- Works on Hyprland and Sway (auto-detected)
+- Real window thumbnails via hyprland-toplevel-export protocol (Hyprland only)
 - Fullscreen overlay using wlr-layer-shell
 - Keyboard navigation (arrow keys / hjkl)
 - Move the active window to another workspace with `m`
 - Runs as a daemon, toggled with SIGUSR1 (~0% CPU when hidden)
-- Direct IPC via Hyprland's unix socket (no process spawning)
+- Direct IPC via the compositor's unix socket (no process spawning)
 - TOML config file for colors, fonts, and behavior
 
 ## Dependencies
@@ -78,6 +81,13 @@ exec-once = hyprexpose
 bind = $mainMod, Tab, exec, pkill -SIGUSR1 hyprexpose
 ```
 
+Or to your Sway config:
+
+```
+exec hyprexpose
+bindsym $mod+Tab exec pkill -SIGUSR1 hyprexpose
+```
+
 ## Install (AUR)
 
 ```
@@ -110,8 +120,8 @@ See [`config.example.toml`](config.example.toml) for all available options with 
 
 hyprexpose runs as a background daemon that does nothing until it receives SIGUSR1. On signal, it:
 
-1. Queries Hyprland's IPC socket for active workspaces and clients
-2. Captures window thumbnails via the hyprland-toplevel-export protocol
+1. Queries the compositor's IPC socket for active workspaces and clients (Hyprland socket or i3-ipc on Sway)
+2. Captures window thumbnails via the hyprland-toplevel-export protocol (Hyprland only)
 3. Renders workspace cards with Cairo/Pango onto a wlr-layer-shell overlay
 4. Waits for keyboard input, then switches workspace (or moves a window) and hides
 
