@@ -1,6 +1,5 @@
 { lib
 , rustPlatform
-, fetchFromGitHub
 , pkg-config
 , wayland
 , wayland-protocols
@@ -15,16 +14,13 @@
 
 rustPlatform.buildRustPackage rec {
   pname = "hyprexpose";
-  version = "ba81e47";
+  version = "0.1.0";
 
-  src = fetchFromGitHub {
-    owner = "ThiagoAVicente";
-    repo = "hyprexpose";
-    rev = "ba81e47f00f1da941864d51de1a3f677c98f3c96";
-    hash = "sha256-ezNCERdDSBr8avQa38A4iXDG3lTkqqstUONINwu7pfg=";
+  src = ./.;
+
+  cargoLock = {
+    lockFile = ./Cargo.lock;
   };
-
-  cargoHash = "sha256-eymgYj6WlrFHS7TBAv3jQVb6aJGBM3lt6WlZf4Esi14=";
 
   nativeBuildInputs = [
     pkg-config
@@ -47,7 +43,7 @@ rustPlatform.buildRustPackage rec {
   '';
 
   meta = with lib; {
-    description = "Lightweight workspace overview for Hyprland";
+    description = "Lightweight workspace overview for Hyprland and Sway";
     homepage = "https://github.com/ThiagoAVicente/hyprexpose";
     license = licenses.mit;
     platforms = platforms.linux;

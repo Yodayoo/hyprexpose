@@ -1,33 +1,18 @@
 { pkgs ? import <nixpkgs> {} }:
 
+let
+  drv = pkgs.callPackage ./default.nix {};
+in
 pkgs.mkShell {
+  inputsFrom = [ drv ];
+
   nativeBuildInputs = with pkgs; [
-    pkg-config
     cargo
     rustc
     rust-analyzer
-    wayland-scanner
-    gobject-introspection
-  ];
-
-  buildInputs = with pkgs; [
-    wayland
-    wayland-protocols
-    cairo
-    pango
-    glib
-    libxkbcommon
-    fontconfig
   ];
 
   shellHook = ''
-    export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (with pkgs; [
-      wayland
-      cairo
-      pango
-      glib
-      libxkbcommon
-      fontconfig
-    ])}:$LD_LIBRARY_PATH
+    export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath drv.buildInputs}:$LD_LIBRARY_PATH
   '';
 }
