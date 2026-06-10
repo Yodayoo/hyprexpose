@@ -84,7 +84,7 @@ const XKB_KEY_8: u32 = 0x0038;
 const XKB_KEY_9: u32 = 0x0039;
 
 fn keycode_to_keysym(keycode: u32) -> u32 {
-    // Hyprland sends raw evdev keycodes via wl_keyboard.
+    // Compositors send raw evdev keycodes via wl_keyboard.
     match keycode {
         1   => XKB_KEY_ESCAPE,
         28  => XKB_KEY_RETURN,
@@ -209,7 +209,7 @@ impl AppState {
             XKB_KEY_1 ..= XKB_KEY_9 => {
                 let idx = (keysym - XKB_KEY_1) as usize;
                 if idx < n {
-                    ipc::switch_workspace(self.workspaces[idx].id);
+                    ipc::switch_workspace(&self.workspaces[idx]);
                 }
                 return true;
             }
@@ -253,7 +253,7 @@ impl AppState {
 
     fn activate_selected_workspace(&self) {
         if self.selected < self.workspaces.len() {
-            ipc::switch_workspace(self.workspaces[self.selected].id);
+            ipc::switch_workspace(&self.workspaces[self.selected]);
         }
     }
 
@@ -263,10 +263,10 @@ impl AppState {
         if self.active_window_address == 0 || self.selected >= self.workspaces.len() {
             return false;
         }
-        let target_id = self.workspaces[self.selected].id;
-        ipc::move_window_to_workspace(self.active_window_address, target_id);
+        let target = &self.workspaces[self.selected];
+        ipc::move_window_to_workspace(self.active_window_address, target);
         if self.config.behavior.switch_on_move {
-            ipc::switch_workspace(target_id);
+            ipc::switch_workspace(target);
         }
         true
     }
@@ -751,7 +751,10 @@ fn refresh_data(
     state.workspaces = ipc::get_workspaces();
     state.thumbnails.clear();
 
-    if !state.no_preview {
+    // Thumbnails need the hyprland-toplevel-export protocol; on other
+    // compositors (e.g. Sway) the manager is absent and we fall back to
+    // colored rectangles.
+    if !state.no_preview && state.toplevel_export.is_some() {
         let addrs: Vec<u64> = state
             .workspaces
             .iter()
@@ -765,11 +768,11 @@ fn refresh_data(
         }
     }
 
-    let active = ipc::get_active_workspace();
+    let active = ipc::get_active_workspace_name();
     state.selected = state
         .workspaces
         .iter()
-        .position(|ws| ws.id == active)
+        .position(|ws| ws.name == active)
         .unwrap_or(0);
 }
 
@@ -816,7 +819,17 @@ fn main() {
         std::process::exit(1);
     }
 
-    eprintln!("hyprexpose: daemon running (send SIGUSR1 to toggle)");
+    if state.toplevel_export.is_none() && !state.no_preview {
+        eprintln!(
+            "hyprexpose: hyprland-toplevel-export protocol unavailable; \
+             window previews disabled (colored rectangles will be used)"
+        );
+    }
+
+    eprintln!(
+        "hyprexpose: daemon running on {} (send SIGUSR1 to toggle)",
+        ipc::compositor().name()
+    );
 
     let display_fd = conn.as_fd().as_raw_fd();
 

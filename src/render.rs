@@ -178,10 +178,16 @@ pub fn draw(
         // Workspace label
         {
             let layout = pangocairo::functions::create_layout(&cr);
-            let mut label = ws.id.to_string();
+            // Named workspaces without a number (sway: num == -1) show just the name.
+            let mut label = if ws.id >= 1 { ws.id.to_string() } else { String::new() };
             if !ws.name.is_empty() && ws.name != label {
-                label.push(' ');
+                if !label.is_empty() {
+                    label.push(' ');
+                }
                 label.push_str(&ws.name);
+            }
+            if label.is_empty() {
+                label = ws.id.to_string();
             }
             layout.set_text(&label);
             layout.set_font_description(Some(&label_font));
