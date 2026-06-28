@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
 use super::{ClientInfo, WorkspaceInfo};
@@ -15,6 +16,7 @@ fn hypr_request(cmd: &str) -> Option<String> {
     let mut stream = UnixStream::connect(&path).ok()?;
     let msg = format!("j/{cmd}");
     stream.write_all(msg.as_bytes()).ok()?;
+    stream.shutdown(Shutdown::Write).ok();
     let mut resp = String::new();
     stream.read_to_string(&mut resp).ok()?;
     Some(resp)
@@ -176,6 +178,7 @@ fn dispatch(cmd: &str) {
     let Ok(mut stream) = UnixStream::connect(&path) else { return };
     let msg = format!("/dispatch {cmd}");
     let _ = stream.write_all(msg.as_bytes());
+    let _ = stream.shutdown(Shutdown::Write);
     let mut buf = [0u8; 256];
     let _ = stream.read(&mut buf);
 }
