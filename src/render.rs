@@ -292,6 +292,55 @@ pub fn compose(scene: &SceneCache, selected_index: usize, cfg: &Config) -> Vec<u
     surface.take_data().map(|d| d.to_vec()).unwrap_or_default()
 }
 
+/// Re-render only the sub-rectangle `(x, y, w, h)` of the frame for
+/// `selected_index`. Returns `w * h * 4` tightly-packed pixels. Used to patch
+/// a retained buffer when just the selection highlight moved, so per-frame
+/// work scales with the highlight area rather than the output size.
+pub fn compose_patch(
+    scene: &SceneCache,
+    selected_index: usize,
+    cfg: &Config,
+    (x, y, w, h): (i32, i32, i32, i32),
+) -> Vec<u8> {
+    let stride = (w * 4) as usize;
+    let size = stride * h as usize;
+
+    let surface = match ImageSurface::create_for_data(
+        vec![0u8; size], Format::ARgb32, w, h, stride as i32,
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![0u8; size],
+    };
+    let cr = match Context::new(&surface) {
+        Ok(c) => c,
+        Err(_) => return vec![0u8; size],
+    };
+
+    // Draw in frame coordinates, shifted so the patch region lands at (0, 0).
+    cr.translate(-(x as f64), -(y as f64));
+
+    let (br, bg, bb, ba) = cfg.colors.background.rgba();
+    cr.set_operator(cairo::Operator::Source);
+    cr.set_source_rgba(br, bg, bb, ba);
+    cr.paint().ok();
+    cr.set_operator(cairo::Operator::Over);
+
+    if let Some(&(cx, cy, cw, ch)) = scene.card_rects.get(selected_index) {
+        let b = cfg.appearance.select_border;
+        let r = cfg.appearance.card_radius;
+        let (sr, sg, sb, sa) = cfg.colors.selection.rgba();
+        rounded_rect(&cr, cx - b, cy - b, cw + 2.0 * b, ch + 2.0 * b, r + 2.0);
+        cr.set_source_rgba(sr, sg, sb, sa);
+        cr.fill().ok();
+    }
+
+    cr.set_source_surface(&scene.layer, 0.0, 0.0).ok();
+    cr.paint().ok();
+
+    drop(cr);
+    surface.take_data().map(|d| d.to_vec()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +410,35 @@ mod tests {
                             "differing pixel ({x},{y}) outside damage rects for {s0}->{s1}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// compose_patch must reproduce exactly the same pixels as the
+    /// corresponding region of a full compose(), for any selection.
+    #[test]
+    fn patch_matches_full_compose() {
+        let (workspaces, thumbnails) = fake_scene();
+        let cfg = Config::default();
+        let (w, h) = (1280u32, 800u32);
+        let scene = build_scene(w, h, &workspaces, &thumbnails, &cfg, 0xb).unwrap();
+        let stride = (w * 4) as usize;
+
+        for sel in 0..workspaces.len() {
+            let full = compose(&scene, sel, &cfg);
+            for idx in 0..workspaces.len() {
+                let rect = scene.highlight_rect(idx, &cfg).unwrap();
+                let patch = compose_patch(&scene, sel, &cfg, rect);
+                let (rx, ry, rw, rh) = rect;
+                let prow = (rw * 4) as usize;
+                for row in 0..rh as usize {
+                    let f0 = (ry as usize + row) * stride + rx as usize * 4;
+                    assert_eq!(
+                        &patch[row * prow..(row + 1) * prow],
+                        &full[f0..f0 + prow],
+                        "sel={sel} rect={idx} row={row}"
+                    );
                 }
             }
         }

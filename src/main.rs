@@ -136,7 +136,7 @@ struct AppState {
     // Per-show Wayland objects (recreated on each show)
     wl_surf: Option<wl_surface::WlSurface>,
     layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
-    wl_buf: Option<wl_buffer::WlBuffer>,
+    slab: Option<ShmSlab>,
 
     // Surface / overlay state
     width: u32,
@@ -151,9 +151,6 @@ struct AppState {
     thumbnails: Vec<Thumbnail>,
     /// Pre-rendered selection-independent scene; rebuilt on show/resize.
     scene: Option<render::SceneCache>,
-    /// Selection index of the last frame committed to the current surface,
-    /// used to damage only the two highlight regions that changed.
-    last_drawn_selected: Option<usize>,
     selected: usize,
     no_preview: bool,
     active_window_address: u64,
@@ -181,7 +178,7 @@ impl AppState {
             toplevel_export: None,
             wl_surf: None,
             layer_surface: None,
-            wl_buf: None,
+            slab: None,
             width: 0,
             height: 0,
             configured: false,
@@ -191,7 +188,6 @@ impl AppState {
             workspaces: Vec::new(),
             thumbnails: Vec::new(),
             scene: None,
-            last_drawn_selected: None,
             selected: 0,
             no_preview,
             active_window_address: 0,
@@ -360,10 +356,6 @@ wayland_client::delegate_noop!(AppState: ignore HyprlandToplevelExportManagerV1)
 
 impl Dispatch<wl_shm::WlShm, ()> for AppState {
     fn event(_: &mut Self, _: &wl_shm::WlShm, _: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-
-impl Dispatch<wl_buffer::WlBuffer, ()> for AppState {
-    fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
 impl Dispatch<wl_surface::WlSurface, ()> for AppState {
@@ -558,8 +550,8 @@ fn show(state: &mut AppState, qh: &QueueHandle<AppState>) -> bool {
 }
 
 fn hide(state: &mut AppState) {
-    if let Some(buf) = state.wl_buf.take() {
-        buf.destroy();
+    if let Some(slab) = state.slab.take() {
+        slab.destroy();
     }
     if let Some(ls) = state.layer_surface.take() {
         ls.destroy();
@@ -573,7 +565,107 @@ fn hide(state: &mut AppState) {
     state.thumbnails.clear();
     // Workspace contents may change while hidden; rebuild the scene next show.
     state.scene = None;
-    state.last_drawn_selected = None;
+}
+
+impl Dispatch<wl_buffer::WlBuffer, usize> for AppState {
+    fn event(state: &mut Self, _: &wl_buffer::WlBuffer, event: wl_buffer::Event, idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
+        if let wl_buffer::Event::Release = event {
+            if let Some(slab) = state.slab.as_mut() {
+                if *idx < slab.busy.len() {
+                    slab.busy[*idx] = false;
+                }
+            }
+        }
+    }
+}
+
+/// A persistent, double-buffered shared-memory allocation reused across
+/// frames, instead of a fresh memfd + pool + buffer per redraw. Each buffer
+/// remembers which selection it currently displays so a navigation event only
+/// needs to re-render the old + new highlight rectangles into it.
+struct ShmSlab {
+    _fd: OwnedFd,
+    map: *mut u8,
+    map_len: usize,
+    pool: wl_shm_pool::WlShmPool,
+    bufs: [wl_buffer::WlBuffer; 2],
+    /// Attached and not yet released by the compositor.
+    busy: [bool; 2],
+    /// Selection index whose frame each buffer holds; None = no valid frame.
+    shown: [Option<usize>; 2],
+    last_attached: usize,
+    width: u32,
+    height: u32,
+}
+
+impl ShmSlab {
+    fn frame_size(&self) -> usize {
+        (self.width * 4 * self.height) as usize
+    }
+
+    /// Mutable view of one buffer's pixels.
+    fn frame_mut(&mut self, idx: usize) -> &mut [u8] {
+        let size = self.frame_size();
+        unsafe { std::slice::from_raw_parts_mut(self.map.add(idx * size), size) }
+    }
+
+    fn destroy(self) {
+        for b in &self.bufs {
+            b.destroy();
+        }
+        self.pool.destroy();
+        unsafe { libc::munmap(self.map as *mut libc::c_void, self.map_len) };
+    }
+}
+
+fn create_slab(state: &mut AppState, qh: &QueueHandle<AppState>) -> Option<ShmSlab> {
+    let shm = state.shm.as_ref()?;
+    let (width, height) = (state.width, state.height);
+    let stride = width * 4;
+    let frame = (stride * height) as usize;
+    let total = frame * 2;
+
+    let fd = create_shm_fd(total)?;
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_fd().as_raw_fd(),
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        return None;
+    }
+
+    let pool = shm.create_pool(fd.as_fd(), total as i32, qh, ());
+    let mk = |i: usize| {
+        pool.create_buffer(
+            (i * frame) as i32,
+            width as i32,
+            height as i32,
+            stride as i32,
+            wl_shm::Format::Argb8888,
+            qh,
+            i,
+        )
+    };
+    let bufs = [mk(0), mk(1)];
+
+    Some(ShmSlab {
+        _fd: fd,
+        map: map as *mut u8,
+        map_len: total,
+        pool,
+        bufs,
+        busy: [false; 2],
+        shown: [None; 2],
+        last_attached: 1,
+        width,
+        height,
+    })
 }
 
 fn redraw(state: &mut AppState, qh: &QueueHandle<AppState>) {
@@ -583,13 +675,13 @@ fn redraw(state: &mut AppState, qh: &QueueHandle<AppState>) {
 
     // (Re)build the selection-independent scene only when missing or stale
     // (first draw after show, or the surface was resized). Navigation events
-    // reuse it and only re-composite, which fixes the CPU spikes of issue #14.
-    let stale = state
+    // reuse it, which fixes the CPU spikes of issue #14.
+    let scene_stale = state
         .scene
         .as_ref()
         .map(|s| s.width != state.width || s.height != state.height)
         .unwrap_or(true);
-    if stale {
+    if scene_stale {
         state.scene = render::build_scene(
             state.width,
             state.height,
@@ -598,59 +690,86 @@ fn redraw(state: &mut AppState, qh: &QueueHandle<AppState>) {
             &state.config,
             state.active_window_address,
         );
-        state.last_drawn_selected = None;
+        if let Some(slab) = state.slab.as_mut() {
+            slab.shown = [None; 2]; // cached frames no longer match the scene
+        }
     }
-    let Some(scene) = &state.scene else { return };
-
-    let pixels = render::compose(scene, state.selected, &state.config);
-
-    let stride = state.width * 4;
-    let size = (stride * state.height) as usize;
-
-    let Some(fd) = create_shm_fd(size) else { return };
-    let raw_fd = fd.as_fd().as_raw_fd();
-
-    let written = unsafe { libc::write(raw_fd, pixels.as_ptr() as *const libc::c_void, size) };
-    if written < 0 {
+    if state.scene.is_none() {
         return;
     }
 
-    let Some(shm) = &state.shm else { return };
-    let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
-    drop(fd); // compositor mapped it; safe to close our end
+    // (Re)create the double-buffered shm allocation when missing or resized.
+    let slab_stale = state
+        .slab
+        .as_ref()
+        .map(|s| s.width != state.width || s.height != state.height)
+        .unwrap_or(true);
+    if slab_stale {
+        if let Some(old) = state.slab.take() {
+            old.destroy();
+        }
+        state.slab = create_slab(state, qh);
+    }
+    let (Some(scene), Some(slab)) = (&state.scene, state.slab.as_mut()) else { return };
 
-    let buf = pool.create_buffer(
-        0,
-        state.width as i32,
-        state.height as i32,
-        stride as i32,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-    pool.destroy();
+    // Prefer the buffer the compositor isn't holding; with two buffers and
+    // discrete redraws the previous one is normally released by now.
+    let idx = {
+        let next = 1 - slab.last_attached;
+        if !slab.busy[next] { next } else if !slab.busy[slab.last_attached] { slab.last_attached } else { next }
+    };
 
-    if let Some(surf) = &state.wl_surf {
-        surf.attach(Some(&buf), 0, 0);
-        // If only the selection moved since the last committed frame, the
-        // rest of the buffer is pixel-identical: damage just the old and new
-        // highlight regions instead of the whole output.
-        match state.last_drawn_selected {
-            Some(prev) => {
-                for idx in [prev, state.selected] {
-                    if let Some((x, y, w, h)) = scene.highlight_rect(idx, &state.config) {
-                        surf.damage_buffer(x, y, w, h);
+    let stride = (state.width * 4) as usize;
+    let selected = state.selected;
+
+    // What is currently on screen (the other buffer's frame). Damage must be
+    // computed against this, while patching must cover whatever is stale in
+    // the buffer we are about to reuse — take the union of both.
+    let on_screen = slab.shown[slab.last_attached];
+
+    let damage: Vec<(i32, i32, i32, i32)> = match (slab.shown[idx], on_screen) {
+        // Fast path: this buffer holds a valid frame; only highlight
+        // rectangles can differ. Re-render those and report as damage the
+        // same set (it covers both the buffer-relative and screen-relative
+        // diffs, at worst one extra small rect).
+        (Some(buf_prev), screen_prev) => {
+            let mut rects = Vec::with_capacity(3);
+            for s in [Some(buf_prev), screen_prev, Some(selected)].into_iter().flatten() {
+                if let Some(r) = scene.highlight_rect(s, &state.config) {
+                    if !rects.contains(&r) {
+                        rects.push(r);
                     }
                 }
             }
-            None => surf.damage_buffer(0, 0, state.width as i32, state.height as i32),
+            let frame = slab.frame_mut(idx);
+            for &rect in &rects {
+                let patch = render::compose_patch(scene, selected, &state.config, rect);
+                let (x, y, w, h) = rect;
+                let prow = (w * 4) as usize;
+                for row in 0..h as usize {
+                    let dst = (y as usize + row) * stride + x as usize * 4;
+                    frame[dst..dst + prow].copy_from_slice(&patch[row * prow..(row + 1) * prow]);
+                }
+            }
+            rects
+        }
+        // Full frame (first draw into this buffer, or scene was rebuilt).
+        (None, _) => {
+            let pixels = render::compose(scene, selected, &state.config);
+            slab.frame_mut(idx).copy_from_slice(&pixels);
+            vec![(0, 0, state.width as i32, state.height as i32)]
+        }
+    };
+
+    if let Some(surf) = &state.wl_surf {
+        surf.attach(Some(&slab.bufs[idx]), 0, 0);
+        for (x, y, w, h) in damage {
+            surf.damage_buffer(x, y, w, h);
         }
         surf.commit();
-        state.last_drawn_selected = Some(state.selected);
-    }
-
-    if let Some(old) = state.wl_buf.replace(buf) {
-        old.destroy();
+        slab.busy[idx] = true;
+        slab.shown[idx] = Some(selected);
+        slab.last_attached = idx;
     }
 }
 
@@ -727,7 +846,7 @@ fn capture_toplevel(
         cap.stride as i32,
         wl_fmt,
         qh,
-        (),
+        usize::MAX, // capture scratch buffer; not part of the display slab
     );
     pool.destroy();
     drop(owned_fd); // compositor has the mapping; safe to close our fd end
