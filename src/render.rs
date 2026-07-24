@@ -10,6 +10,35 @@ pub struct Thumbnail {
     pub stride: u32,
 }
 
+/// Everything that does not depend on the current selection, rendered once
+/// per show: workspace cards, labels and (pre-scaled) window thumbnails on a
+/// transparent layer. Navigating between workspaces then only needs to
+/// composite this layer over the background + selection highlight instead of
+/// re-rendering the whole scene (see issue #14).
+pub struct SceneCache {
+    layer: ImageSurface,
+    /// (x, y, w, h) of each workspace card, index-aligned with `workspaces`.
+    card_rects: Vec<(f64, f64, f64, f64)>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SceneCache {
+    /// Bounding box (x, y, w, h) of the selection highlight for card `index`,
+    /// in integer pixels, suitable for `wl_surface.damage_buffer`.
+    pub fn highlight_rect(&self, index: usize, cfg: &Config) -> Option<(i32, i32, i32, i32)> {
+        let (cx, cy, cw, ch) = *self.card_rects.get(index)?;
+        // Highlight extends select_border past the card on every side; pad a
+        // couple of extra pixels for the larger corner radius / antialiasing.
+        let m = cfg.appearance.select_border + 3.0;
+        let x0 = (cx - m).floor().max(0.0) as i32;
+        let y0 = (cy - m).floor().max(0.0) as i32;
+        let x1 = ((cx + cw + m).ceil() as i32).min(self.width as i32);
+        let y1 = ((cy + ch + m).ceil() as i32).min(self.height as i32);
+        Some((x0, y0, (x1 - x0).max(0), (y1 - y0).max(0)))
+    }
+}
+
 fn rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     use std::f64::consts::PI;
     cr.new_sub_path();
@@ -98,40 +127,24 @@ fn draw_client(
     }
 }
 
-pub fn draw(
+/// Render everything that doesn't depend on the selection (cards, labels,
+/// thumbnails) once. Called when the overlay is (re)shown or resized.
+pub fn build_scene(
     width: u32,
     height: u32,
     workspaces: &[WorkspaceInfo],
-    selected_index: usize,
     thumbnails: &[Thumbnail],
     cfg: &Config,
     active_window_address: u64,
-) -> Vec<u8> {
-    let stride = width * 4;
-    let size = (stride * height) as usize;
-    let buf = vec![0u8; size];
+) -> Option<SceneCache> {
+    let surface = ImageSurface::create(Format::ARgb32, width as i32, height as i32).ok()?;
+    let cr = Context::new(&surface).ok()?;
 
-    let surface = match ImageSurface::create_for_data(
-        buf, Format::ARgb32, width as i32, height as i32, stride as i32,
-    ) {
-        Ok(s) => s,
-        Err(_) => return vec![0u8; size],
-    };
-    let cr = match Context::new(&surface) {
-        Ok(c) => c,
-        Err(_) => return vec![0u8; size],
-    };
-
-    // Dimmed background
-    let (br, bg, bb, ba) = cfg.colors.background.rgba();
-    cr.set_operator(cairo::Operator::Source);
-    cr.set_source_rgba(br, bg, bb, ba);
-    cr.paint().ok();
-    cr.set_operator(cairo::Operator::Over);
+    let mut card_rects = Vec::with_capacity(workspaces.len());
 
     if workspaces.is_empty() {
         drop(cr);
-        return surface.take_data().map(|d| d.to_vec()).unwrap_or_default();
+        return Some(SceneCache { layer: surface, card_rects, width, height });
     }
 
     let n = workspaces.len();
@@ -159,15 +172,8 @@ pub fn draw(
         let cx = ox + col as f64 * (card_w + pad);
         let cy = oy + row as f64 * (card_h + pad);
         let r = cfg.appearance.card_radius;
-        let select_border_w = cfg.appearance.select_border;
 
-        // Selection highlight
-        if i == selected_index {
-            let (sr, sg, sb, sa) = cfg.colors.selection.rgba();
-            rounded_rect(&cr, cx - select_border_w, cy - select_border_w, card_w + 2.0 * select_border_w, card_h + 2.0 * select_border_w, r + 2.0);
-            cr.set_source_rgba(sr, sg, sb, sa);
-            cr.fill().ok();
-        }
+        card_rects.push((cx, cy, card_w, card_h));
 
         // Card background
         let (cr_c, cg, cb, ca) = cfg.colors.card.rgba();
@@ -238,5 +244,135 @@ pub fn draw(
     }
 
     drop(cr);
+    Some(SceneCache { layer: surface, card_rects, width, height })
+}
+
+/// Produce the final frame for the current selection: dimmed background,
+/// selection highlight, then the cached scene layer on top. This is the only
+/// work done per navigation event and is a couple of fills plus one blit.
+pub fn compose(scene: &SceneCache, selected_index: usize, cfg: &Config) -> Vec<u8> {
+    let width = scene.width;
+    let height = scene.height;
+    let stride = width * 4;
+    let size = (stride * height) as usize;
+
+    let surface = match ImageSurface::create_for_data(
+        vec![0u8; size], Format::ARgb32, width as i32, height as i32, stride as i32,
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![0u8; size],
+    };
+    let cr = match Context::new(&surface) {
+        Ok(c) => c,
+        Err(_) => return vec![0u8; size],
+    };
+
+    // Dimmed background
+    let (br, bg, bb, ba) = cfg.colors.background.rgba();
+    cr.set_operator(cairo::Operator::Source);
+    cr.set_source_rgba(br, bg, bb, ba);
+    cr.paint().ok();
+    cr.set_operator(cairo::Operator::Over);
+
+    // Selection highlight (sits underneath the card, exactly as before)
+    if let Some(&(cx, cy, cw, ch)) = scene.card_rects.get(selected_index) {
+        let b = cfg.appearance.select_border;
+        let r = cfg.appearance.card_radius;
+        let (sr, sg, sb, sa) = cfg.colors.selection.rgba();
+        rounded_rect(&cr, cx - b, cy - b, cw + 2.0 * b, ch + 2.0 * b, r + 2.0);
+        cr.set_source_rgba(sr, sg, sb, sa);
+        cr.fill().ok();
+    }
+
+    // Cached cards / thumbnails / labels
+    cr.set_source_surface(&scene.layer, 0.0, 0.0).ok();
+    cr.paint().ok();
+
+    drop(cr);
     surface.take_data().map(|d| d.to_vec()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{ClientInfo, WorkspaceInfo};
+
+    fn fake_thumb(address: u64, w: u32, h: u32) -> Thumbnail {
+        let stride = w * 4;
+        let mut data = vec![0u8; (stride * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * stride) + x * 4) as usize;
+                data[i] = (x % 256) as u8;
+                data[i + 1] = (y % 256) as u8;
+                data[i + 2] = 128;
+                data[i + 3] = 255;
+            }
+        }
+        Thumbnail { address, data, width: w, height: h, stride }
+    }
+
+    fn fake_scene() -> (Vec<WorkspaceInfo>, Vec<Thumbnail>) {
+        let mk = |addr: u64, class: &str, x, y, w, h, ws| ClientInfo {
+            class_name: class.into(),
+            title: format!("{class} title"),
+            address: addr,
+            workspace_id: ws,
+            x, y, w, h,
+        };
+        let workspaces = vec![
+            WorkspaceInfo {
+                id: 1, name: "1".into(), monitor_id: 0,
+                clients: vec![mk(0xa, "kitty", 0, 0, 960, 1080, 1), mk(0xb, "firefox", 960, 0, 960, 1080, 1)],
+            },
+            WorkspaceInfo { id: 2, name: "web".into(), monitor_id: 0, clients: vec![mk(0xc, "chromium", 100, 100, 1720, 880, 2)] },
+            WorkspaceInfo { id: 3, name: "3".into(), monitor_id: 0, clients: vec![] },
+            WorkspaceInfo { id: 4, name: "4".into(), monitor_id: 0, clients: vec![mk(0xd, "", 0, 0, 1920, 1080, 4)] },
+        ];
+        let thumbnails = vec![fake_thumb(0xa, 320, 200), fake_thumb(0xc, 400, 240)];
+        (workspaces, thumbnails)
+    }
+
+    /// Every pixel that changes when the selection moves must fall inside
+    /// the union of the two damage rects reported by `highlight_rect`,
+    /// otherwise partial damage in `redraw()` would leave stale pixels.
+    #[test]
+    fn highlight_rect_covers_selection_change() {
+        let (workspaces, thumbnails) = fake_scene();
+        let cfg = Config::default();
+        let (w, h) = (1280u32, 800u32);
+        let scene = build_scene(w, h, &workspaces, &thumbnails, &cfg, 0xb).unwrap();
+
+        for (s0, s1) in [(0usize, 1usize), (0, 2), (1, 3), (2, 3)] {
+            let a = compose(&scene, s0, &cfg);
+            let b = compose(&scene, s1, &cfg);
+            let r0 = scene.highlight_rect(s0, &cfg).unwrap();
+            let r1 = scene.highlight_rect(s1, &cfg).unwrap();
+            let inside = |x: i32, y: i32, (rx, ry, rw, rh): (i32, i32, i32, i32)| {
+                x >= rx && x < rx + rw && y >= ry && y < ry + rh
+            };
+            let stride = (w * 4) as usize;
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let i = y as usize * stride + x as usize * 4;
+                    if a[i..i + 4] != b[i..i + 4] {
+                        assert!(
+                            inside(x, y, r0) || inside(x, y, r1),
+                            "differing pixel ({x},{y}) outside damage rects for {s0}->{s1}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// compose() must be deterministic for a fixed scene + selection, since
+    /// partial damage assumes undamaged regions are identical across frames.
+    #[test]
+    fn compose_is_deterministic() {
+        let (workspaces, thumbnails) = fake_scene();
+        let cfg = Config::default();
+        let scene = build_scene(1280, 800, &workspaces, &thumbnails, &cfg, 0xb).unwrap();
+        assert_eq!(compose(&scene, 1, &cfg), compose(&scene, 1, &cfg));
+    }
 }

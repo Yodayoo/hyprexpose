@@ -149,6 +149,11 @@ struct AppState {
     // App state
     workspaces: Vec<WorkspaceInfo>,
     thumbnails: Vec<Thumbnail>,
+    /// Pre-rendered selection-independent scene; rebuilt on show/resize.
+    scene: Option<render::SceneCache>,
+    /// Selection index of the last frame committed to the current surface,
+    /// used to damage only the two highlight regions that changed.
+    last_drawn_selected: Option<usize>,
     selected: usize,
     no_preview: bool,
     active_window_address: u64,
@@ -185,6 +190,8 @@ impl AppState {
             needs_redraw: false,
             workspaces: Vec::new(),
             thumbnails: Vec::new(),
+            scene: None,
+            last_drawn_selected: None,
             selected: 0,
             no_preview,
             active_window_address: 0,
@@ -564,6 +571,9 @@ fn hide(state: &mut AppState) {
     state.visible = false;
     state.workspaces.clear();
     state.thumbnails.clear();
+    // Workspace contents may change while hidden; rebuild the scene next show.
+    state.scene = None;
+    state.last_drawn_selected = None;
 }
 
 fn redraw(state: &mut AppState, qh: &QueueHandle<AppState>) {
@@ -571,15 +581,28 @@ fn redraw(state: &mut AppState, qh: &QueueHandle<AppState>) {
         return;
     }
 
-    let pixels = render::draw(
-        state.width,
-        state.height,
-        &state.workspaces,
-        state.selected,
-        &state.thumbnails,
-        &state.config,
-        state.active_window_address,
-    );
+    // (Re)build the selection-independent scene only when missing or stale
+    // (first draw after show, or the surface was resized). Navigation events
+    // reuse it and only re-composite, which fixes the CPU spikes of issue #14.
+    let stale = state
+        .scene
+        .as_ref()
+        .map(|s| s.width != state.width || s.height != state.height)
+        .unwrap_or(true);
+    if stale {
+        state.scene = render::build_scene(
+            state.width,
+            state.height,
+            &state.workspaces,
+            &state.thumbnails,
+            &state.config,
+            state.active_window_address,
+        );
+        state.last_drawn_selected = None;
+    }
+    let Some(scene) = &state.scene else { return };
+
+    let pixels = render::compose(scene, state.selected, &state.config);
 
     let stride = state.width * 4;
     let size = (stride * state.height) as usize;
@@ -609,8 +632,21 @@ fn redraw(state: &mut AppState, qh: &QueueHandle<AppState>) {
 
     if let Some(surf) = &state.wl_surf {
         surf.attach(Some(&buf), 0, 0);
-        surf.damage_buffer(0, 0, state.width as i32, state.height as i32);
+        // If only the selection moved since the last committed frame, the
+        // rest of the buffer is pixel-identical: damage just the old and new
+        // highlight regions instead of the whole output.
+        match state.last_drawn_selected {
+            Some(prev) => {
+                for idx in [prev, state.selected] {
+                    if let Some((x, y, w, h)) = scene.highlight_rect(idx, &state.config) {
+                        surf.damage_buffer(x, y, w, h);
+                    }
+                }
+            }
+            None => surf.damage_buffer(0, 0, state.width as i32, state.height as i32),
+        }
         surf.commit();
+        state.last_drawn_selected = Some(state.selected);
     }
 
     if let Some(old) = state.wl_buf.replace(buf) {
