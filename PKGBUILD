@@ -1,16 +1,20 @@
 # Maintainer: ThiagoAVicente <todo@example.com>
-pkgname=hyprexpose-git
+# Custom fork: adds a "+ Add Desktop" button/keybind and an
+# on_current_monitor workspace-switch fix. See:
+# https://github.com/Yodayoo/hyprexpose
+pkgname=hyprexpose-custom-git
 pkgver=r0
 pkgrel=1
-pkgdesc='Lightweight workspace overview for Hyprland with live window thumbnails'
+pkgdesc='Lightweight workspace overview for Hyprland with live window thumbnails (custom fork with an Add Desktop button)'
 arch=('x86_64')
-url='https://github.com/ThiagoAVicente/hyprexpose'
+url='https://github.com/Yodayoo/hyprexpose'
 license=('MIT')
 depends=('wayland' 'cairo' 'pango' 'hyprland>=0.55')
 makedepends=('git' 'rust' 'cargo')
-provides=('hyprexpose')
-conflicts=('hyprexpose')
-source=("git+${url}.git")
+provides=('hyprexpose' 'hyprexpose-git')
+conflicts=('hyprexpose' 'hyprexpose-git')
+replaces=('hyprexpose-git')
+source=("git+${url}.git#branch=master")
 sha256sums=('SKIP')
 
 pkgver() {
