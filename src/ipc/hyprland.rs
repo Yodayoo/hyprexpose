@@ -184,9 +184,13 @@ fn dispatch(cmd: &str) {
 }
 
 pub fn switch_workspace(id: i32) {
-    dispatch(&format!(
-        "hl.dsp.focus({{ workspace = \"{id}\", on_current_monitor = true }})"
-    ));
+    // Plain focus (no on_current_monitor): a workspace already active on
+    // another monitor just pulls focus there instead of being dragged onto
+    // the current monitor; a workspace not active anywhere opens on the
+    // current monitor. on_current_monitor=true was tried here previously but
+    // actually forces a swap between the two monitors' workspaces, which is
+    // the opposite of what's wanted.
+    dispatch(&format!("hl.dsp.focus({{ workspace = \"{id}\" }})"));
 }
 
 pub fn move_window_to_workspace(window_address: u64, workspace_id: i32) {
