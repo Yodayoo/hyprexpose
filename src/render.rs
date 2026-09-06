@@ -94,7 +94,7 @@ fn rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.close_path();
 }
 
-fn draw_add_button(cr: &Context, cfg: &Config, cx: f64, cy: f64, w: f64, h: f64) {
+fn draw_add_button(cr: &Context, cfg: &Config, label_font: &pango::FontDescription, cx: f64, cy: f64, w: f64, h: f64) {
     let r = cfg.appearance.card_radius;
 
     rounded_rect(cr, cx, cy, w, h, r);
@@ -111,8 +111,12 @@ fn draw_add_button(cr: &Context, cfg: &Config, cx: f64, cy: f64, w: f64, h: f64)
     cr.stroke().ok();
     cr.restore().ok();
 
+    // Same font as the workspace number/name label on real cards, so the
+    // button reads as part of the same set rather than a differently-styled
+    // element.
     let layout = pangocairo::functions::create_layout(cr);
-    layout.set_markup("<span size='xx-large'>+</span>\n<span size='small'>Add Desktop</span>");
+    layout.set_text("+ Add Desktop");
+    layout.set_font_description(Some(label_font));
     layout.set_alignment(pango::Alignment::Center);
     let (tw, th) = layout.pixel_size();
     cr.set_source_rgba(lr, lg, lb, la);
@@ -237,7 +241,7 @@ pub fn build_scene(
         card_rects.push((cx, cy, card_w, card_h));
 
         if show_add && i == workspaces.len() {
-            draw_add_button(&cr, cfg, cx, cy, card_w, card_h);
+            draw_add_button(&cr, cfg, &label_font, cx, cy, card_w, card_h);
             continue;
         }
         let ws = &workspaces[i];
