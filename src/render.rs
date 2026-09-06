@@ -94,33 +94,32 @@ fn rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.close_path();
 }
 
-fn draw_add_button(cr: &Context, cfg: &Config, label_font: &pango::FontDescription, cx: f64, cy: f64, w: f64, h: f64) {
+/// Draws identically to an empty workspace card (same background, no
+/// number/name header, same centered-text treatment as "(empty)") so the
+/// button reads as one of the set rather than a distinctly-styled element.
+fn draw_add_button(cr: &Context, cfg: &Config, empty_font: &pango::FontDescription, cx: f64, cy: f64, w: f64, h: f64) {
     let r = cfg.appearance.card_radius;
 
+    // Card background — identical treatment to a real card, empty or not.
+    let (cbr, cbg, cbb, ca) = cfg.colors.card.rgba();
     rounded_rect(cr, cx, cy, w, h, r);
-    let (cbr, cbg, cbb, _) = cfg.colors.card.rgba();
-    cr.set_source_rgba(cbr, cbg, cbb, 0.4); // dimmer than a real card, reads as "not a workspace"
+    cr.set_source_rgba(cbr, cbg, cbb, ca);
     cr.fill().ok();
 
-    cr.save().ok();
-    rounded_rect(cr, cx, cy, w, h, r);
-    let (lr, lg, lb, la) = cfg.colors.label.rgba();
-    cr.set_source_rgba(lr, lg, lb, la * 0.6);
-    cr.set_dash(&[6.0, 5.0], 0.0);
-    cr.set_line_width(2.0);
-    cr.stroke().ok();
-    cr.restore().ok();
+    // Centered text in the same position/font/color an empty card uses for
+    // "(empty)": below the (unused, here blank) label header area.
+    let lh = cfg.appearance.label_height;
+    let tp = cfg.appearance.thumb_padding;
+    let win_y = cy + lh;
+    let win_h = h - lh - tp;
 
-    // Same font as the workspace number/name label on real cards, so the
-    // button reads as part of the same set rather than a differently-styled
-    // element.
     let layout = pangocairo::functions::create_layout(cr);
-    layout.set_text("+ Add Desktop");
-    layout.set_font_description(Some(label_font));
-    layout.set_alignment(pango::Alignment::Center);
+    layout.set_text("Add Desktop");
+    layout.set_font_description(Some(empty_font));
     let (tw, th) = layout.pixel_size();
-    cr.set_source_rgba(lr, lg, lb, la);
-    cr.move_to(cx + (w - tw as f64) / 2.0, cy + (h - th as f64) / 2.0);
+    let (er, eg, eb, ea) = cfg.colors.empty_label.rgba();
+    cr.set_source_rgba(er, eg, eb, ea);
+    cr.move_to(cx + (w - tw as f64) / 2.0, win_y + (win_h - th as f64) / 2.0);
     pangocairo::functions::show_layout(cr, &layout);
 }
 
@@ -241,7 +240,7 @@ pub fn build_scene(
         card_rects.push((cx, cy, card_w, card_h));
 
         if show_add && i == workspaces.len() {
-            draw_add_button(&cr, cfg, &label_font, cx, cy, card_w, card_h);
+            draw_add_button(&cr, cfg, &empty_font, cx, cy, card_w, card_h);
             continue;
         }
         let ws = &workspaces[i];
