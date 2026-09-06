@@ -74,6 +74,15 @@ pub fn move_window_to_workspace(window_address: u64, ws: &WorkspaceInfo) {
     }
 }
 
+/// Switch to a workspace id that doesn't exist yet; the compositor creates
+/// it empty as a side effect. Used by the "Add Desktop" button/keybind.
+pub fn switch_to_new_workspace(id: i32) {
+    match compositor() {
+        Compositor::Hyprland => hyprland::switch_workspace(id),
+        Compositor::Sway => sway::switch_workspace(&id.to_string()),
+    }
+}
+
 /// Name of the currently focused workspace, or empty string if unknown.
 pub fn get_active_workspace_name() -> String {
     match compositor() {

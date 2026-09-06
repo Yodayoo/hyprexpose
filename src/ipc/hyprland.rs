@@ -184,7 +184,9 @@ fn dispatch(cmd: &str) {
 }
 
 pub fn switch_workspace(id: i32) {
-    dispatch(&format!("hl.dsp.focus({{ workspace = \"{id}\" }})"));
+    dispatch(&format!(
+        "hl.dsp.focus({{ workspace = \"{id}\", on_current_monitor = true }})"
+    ));
 }
 
 pub fn move_window_to_workspace(window_address: u64, workspace_id: i32) {

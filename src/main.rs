@@ -73,6 +73,7 @@ const XKB_KEY_J: u32 = 0x006a;
 const XKB_KEY_K: u32 = 0x006b;
 const XKB_KEY_L: u32 = 0x006c;
 const XKB_KEY_M: u32 = 0x006d;
+const XKB_KEY_N: u32 = 0x006e;
 const XKB_KEY_1: u32 = 0x0031;
 const XKB_KEY_2: u32 = 0x0032;
 const XKB_KEY_3: u32 = 0x0033;
@@ -97,6 +98,7 @@ fn keycode_to_keysym(keycode: u32) -> u32 {
         37  => XKB_KEY_K,
         38  => XKB_KEY_L,
         50  => XKB_KEY_M,
+        49  => XKB_KEY_N,
         2   => XKB_KEY_1,
         3   => XKB_KEY_2,
         4   => XKB_KEY_3,
@@ -199,19 +201,48 @@ impl AppState {
         }
     }
 
+    fn add_button_enabled(&self) -> bool {
+        self.config.behavior.show_add_desktop_button
+    }
+
+    /// Total selectable grid slots, including the optional add-button slot.
+    fn slot_count(&self) -> usize {
+        self.workspaces.len() + self.add_button_enabled() as usize
+    }
+
+    fn is_add_button(&self, index: usize) -> bool {
+        self.add_button_enabled() && index == self.workspaces.len()
+    }
+
+    /// First workspace id >= `add_desktop_start_id` not already in use.
+    fn next_free_workspace_id(&self) -> i32 {
+        let start = self.config.behavior.add_desktop_start_id;
+        (start..)
+            .find(|id| !self.workspaces.iter().any(|w| w.id == *id))
+            .unwrap_or(start)
+    }
+
+    fn add_desktop(&self) {
+        ipc::switch_to_new_workspace(self.next_free_workspace_id());
+    }
+
     /// Returns true if the overlay should be closed.
     fn handle_key(&mut self, keysym: u32) -> bool {
-        let n = self.workspaces.len();
+        let n = self.slot_count();
         if n == 0 {
             return true;
         }
-        let cols = ((n as f64).sqrt().ceil() as usize).max(1);
+        // Falls back to the bare column count if called before the surface
+        // has a size (grid_geometry needs width/height to size cards).
+        let cols = render::grid_geometry(n, self.width, self.height, &self.config)
+            .map(|g| g.cols)
+            .unwrap_or_else(|| ((n as f64).sqrt().ceil() as usize).max(1));
 
         match keysym {
             XKB_KEY_ESCAPE => return true,
             XKB_KEY_1 ..= XKB_KEY_9 => {
                 let idx = (keysym - XKB_KEY_1) as usize;
-                if idx < n {
+                if idx < self.workspaces.len() {
                     ipc::switch_workspace(&self.workspaces[idx]);
                 }
                 return true;
@@ -249,12 +280,22 @@ impl AppState {
                     return true;
                 }
             }
+            XKB_KEY_N => {
+                if self.add_button_enabled() {
+                    self.add_desktop();
+                    return true;
+                }
+            }
             _ => {}
         }
         false
     }
 
     fn activate_selected_workspace(&self) {
+        if self.is_add_button(self.selected) {
+            self.add_desktop();
+            return;
+        }
         if self.selected < self.workspaces.len() {
             ipc::switch_workspace(&self.workspaces[self.selected]);
         }
@@ -275,31 +316,12 @@ impl AppState {
     }
 
     fn workspace_at(&self, x: f64, y: f64) -> Option<usize> {
-        let n = self.workspaces.len();
-        if n == 0 || self.width == 0 || self.height == 0 {
-            return None;
-        }
-
-        let cols = ((n as f64).sqrt().ceil() as usize).max(1);
-        let rows = (n + cols - 1) / cols;
-        let pad = self.config.appearance.card_padding;
-
-        let card_w = ((self.width as f64 - pad * (cols + 1) as f64) / cols as f64)
-            .min(self.config.appearance.max_card_width);
-        let card_h = ((self.height as f64 - pad * (rows + 1) as f64) / rows as f64)
-            .min(self.config.appearance.max_card_height);
-
-        let grid_w = cols as f64 * card_w + (cols.saturating_sub(1)) as f64 * pad;
-        let grid_h = rows as f64 * card_h + (rows.saturating_sub(1)) as f64 * pad;
-        let ox = (self.width as f64 - grid_w) / 2.0;
-        let oy = (self.height as f64 - grid_h) / 2.0;
+        let n = self.slot_count();
+        let geo = render::grid_geometry(n, self.width, self.height, &self.config)?;
 
         for i in 0..n {
-            let col = i % cols;
-            let row = i / cols;
-            let cx = ox + col as f64 * (card_w + pad);
-            let cy = oy + row as f64 * (card_h + pad);
-            if x >= cx && x <= cx + card_w && y >= cy && y <= cy + card_h {
+            let (cx, cy) = geo.slot_origin(i);
+            if x >= cx && x <= cx + geo.card_w && y >= cy && y <= cy + geo.card_h {
                 return Some(i);
             }
         }
@@ -1063,4 +1085,43 @@ fn main() {
     }
 
     hide(&mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ws(id: i32) -> WorkspaceInfo {
+        WorkspaceInfo { id, name: id.to_string(), monitor_id: 0, clients: vec![] }
+    }
+
+    fn state_with(ids: &[i32], start: i32) -> AppState {
+        let mut config = Config::default();
+        config.behavior.add_desktop_start_id = start;
+        let mut state = AppState::new(false, false, config);
+        state.workspaces = ids.iter().map(|&id| ws(id)).collect();
+        state
+    }
+
+    #[test]
+    fn next_free_workspace_id_empty_list_returns_start() {
+        assert_eq!(state_with(&[], 11).next_free_workspace_id(), 11);
+    }
+
+    #[test]
+    fn next_free_workspace_id_ignores_gap_below_start() {
+        // Ids below `start` (e.g. the user's SUPER+1..9 workspaces) must
+        // never be treated as "free" for a new desktop.
+        assert_eq!(state_with(&[1, 2, 3], 11).next_free_workspace_id(), 11);
+    }
+
+    #[test]
+    fn next_free_workspace_id_skips_contiguous_ids_from_start() {
+        assert_eq!(state_with(&[11, 12, 13], 11).next_free_workspace_id(), 14);
+    }
+
+    #[test]
+    fn next_free_workspace_id_finds_gap_at_or_above_start() {
+        assert_eq!(state_with(&[11, 13], 11).next_free_workspace_id(), 12);
+    }
 }

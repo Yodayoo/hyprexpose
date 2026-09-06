@@ -101,6 +101,7 @@ yay -S hyprexpose-git
 | Arrow keys / hjkl | Navigate workspaces |
 | Enter | Switch to selected workspace |
 | `m` | Move active window to selected workspace |
+| `n` | Add and switch to a new empty desktop |
 | Escape | Close overlay |
 
 ## Configuration

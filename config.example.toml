@@ -81,3 +81,12 @@ switch_on_move = true
 #   - right-click  → move the active window to that workspace
 # The `--allow-mouse` CLI flag forces this on regardless of the value here.
 allow_mouse = false
+
+# Show a "+ Add Desktop" button in the overview grid, and enable the `n`
+# keybind. Both switch to the first unused workspace id >= the value below,
+# which is created empty automatically.
+show_add_desktop_button = true
+
+# First workspace id to try when adding a new desktop. Keep this higher than
+# any workspace number you have bound to SUPER+<n>.
+add_desktop_start_id = 11

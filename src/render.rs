@@ -17,7 +17,9 @@ pub struct Thumbnail {
 /// re-rendering the whole scene (see issue #14).
 pub struct SceneCache {
     layer: ImageSurface,
-    /// (x, y, w, h) of each workspace card, index-aligned with `workspaces`.
+    /// (x, y, w, h) of each workspace card, index-aligned with `workspaces`,
+    /// plus one trailing entry for the "+ Add Desktop" button at index
+    /// `workspaces.len()` when `cfg.behavior.show_add_desktop_button`.
     card_rects: Vec<(f64, f64, f64, f64)>,
     pub width: u32,
     pub height: u32,
@@ -39,6 +41,49 @@ impl SceneCache {
     }
 }
 
+/// Grid layout shared by scene rendering, mouse hit-testing, and keyboard
+/// navigation, so the three can't drift out of sync.
+pub(crate) struct GridGeometry {
+    pub cols: usize,
+    #[allow(dead_code)] // kept for debuggability / future callers
+    pub rows: usize,
+    pub card_w: f64,
+    pub card_h: f64,
+    pub ox: f64,
+    pub oy: f64,
+    pub pad: f64,
+}
+
+impl GridGeometry {
+    /// Top-left corner of slot `i` (0-indexed, row-major).
+    pub fn slot_origin(&self, i: usize) -> (f64, f64) {
+        let col = i % self.cols;
+        let row = i / self.cols;
+        (self.ox + col as f64 * (self.card_w + self.pad), self.oy + row as f64 * (self.card_h + self.pad))
+    }
+}
+
+pub(crate) fn grid_geometry(n: usize, width: u32, height: u32, cfg: &Config) -> Option<GridGeometry> {
+    if n == 0 || width == 0 || height == 0 {
+        return None;
+    }
+    let cols = ((n as f64).sqrt().ceil() as usize).max(1);
+    let rows = (n + cols - 1) / cols;
+    let pad = cfg.appearance.card_padding;
+
+    let card_w = ((width as f64 - pad * (cols + 1) as f64) / cols as f64)
+        .min(cfg.appearance.max_card_width);
+    let card_h = ((height as f64 - pad * (rows + 1) as f64) / rows as f64)
+        .min(cfg.appearance.max_card_height);
+
+    let grid_w = cols as f64 * card_w + (cols.saturating_sub(1)) as f64 * pad;
+    let grid_h = rows as f64 * card_h + (rows.saturating_sub(1)) as f64 * pad;
+    let ox = (width as f64 - grid_w) / 2.0;
+    let oy = (height as f64 - grid_h) / 2.0;
+
+    Some(GridGeometry { cols, rows, card_w, card_h, ox, oy, pad })
+}
+
 fn rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     use std::f64::consts::PI;
     cr.new_sub_path();
@@ -47,6 +92,32 @@ fn rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.arc(x + r,     y + h - r, r,  PI / 2.0, PI);
     cr.arc(x + r,     y + r,     r,  PI,       3.0 * PI / 2.0);
     cr.close_path();
+}
+
+fn draw_add_button(cr: &Context, cfg: &Config, cx: f64, cy: f64, w: f64, h: f64) {
+    let r = cfg.appearance.card_radius;
+
+    rounded_rect(cr, cx, cy, w, h, r);
+    let (cbr, cbg, cbb, _) = cfg.colors.card.rgba();
+    cr.set_source_rgba(cbr, cbg, cbb, 0.4); // dimmer than a real card, reads as "not a workspace"
+    cr.fill().ok();
+
+    cr.save().ok();
+    rounded_rect(cr, cx, cy, w, h, r);
+    let (lr, lg, lb, la) = cfg.colors.label.rgba();
+    cr.set_source_rgba(lr, lg, lb, la * 0.6);
+    cr.set_dash(&[6.0, 5.0], 0.0);
+    cr.set_line_width(2.0);
+    cr.stroke().ok();
+    cr.restore().ok();
+
+    let layout = pangocairo::functions::create_layout(cr);
+    layout.set_markup("<span size='xx-large'>+</span>\n<span size='small'>Add Desktop</span>");
+    layout.set_alignment(pango::Alignment::Center);
+    let (tw, th) = layout.pixel_size();
+    cr.set_source_rgba(lr, lg, lb, la);
+    cr.move_to(cx + (w - tw as f64) / 2.0, cy + (h - th as f64) / 2.0);
+    pangocairo::functions::show_layout(cr, &layout);
 }
 
 fn find_thumb<'a>(thumbnails: &'a [Thumbnail], address: u64) -> Option<&'a Thumbnail> {
@@ -140,40 +211,36 @@ pub fn build_scene(
     let surface = ImageSurface::create(Format::ARgb32, width as i32, height as i32).ok()?;
     let cr = Context::new(&surface).ok()?;
 
-    let mut card_rects = Vec::with_capacity(workspaces.len());
+    let show_add = cfg.behavior.show_add_desktop_button;
+    let mut card_rects = Vec::with_capacity(workspaces.len() + show_add as usize);
 
-    if workspaces.is_empty() {
+    if workspaces.is_empty() && !show_add {
         drop(cr);
         return Some(SceneCache { layer: surface, card_rects, width, height });
     }
 
-    let n = workspaces.len();
-    let cols = ((n as f64).sqrt().ceil() as usize).max(1);
-    let rows = (n + cols - 1) / cols;
-    let pad = cfg.appearance.card_padding;
-
-    let card_w = ((width as f64 - pad * (cols + 1) as f64) / cols as f64)
-        .min(cfg.appearance.max_card_width);
-    let card_h = ((height as f64 - pad * (rows + 1) as f64) / rows as f64)
-        .min(cfg.appearance.max_card_height);
-
-    let grid_w = cols as f64 * card_w + (cols - 1) as f64 * pad;
-    let grid_h = rows as f64 * card_h + (rows - 1) as f64 * pad;
-    let ox = (width as f64 - grid_w) / 2.0;
-    let oy = (height as f64 - grid_h) / 2.0;
+    let n = workspaces.len() + show_add as usize;
+    let Some(geo) = grid_geometry(n, width, height, cfg) else {
+        drop(cr);
+        return Some(SceneCache { layer: surface, card_rects, width, height });
+    };
+    let (card_w, card_h) = (geo.card_w, geo.card_h);
 
     let label_font = pango::FontDescription::from_string(&cfg.appearance.label_font);
     let window_font = pango::FontDescription::from_string(&cfg.appearance.font);
     let empty_font = window_font.clone();
 
-    for (i, ws) in workspaces.iter().enumerate() {
-        let col = i % cols;
-        let row = i / cols;
-        let cx = ox + col as f64 * (card_w + pad);
-        let cy = oy + row as f64 * (card_h + pad);
+    for i in 0..n {
+        let (cx, cy) = geo.slot_origin(i);
         let r = cfg.appearance.card_radius;
 
         card_rects.push((cx, cy, card_w, card_h));
+
+        if show_add && i == workspaces.len() {
+            draw_add_button(&cr, cfg, cx, cy, card_w, card_h);
+            continue;
+        }
+        let ws = &workspaces[i];
 
         // Card background
         let (cr_c, cg, cb, ca) = cfg.colors.card.rgba();
@@ -452,5 +519,36 @@ mod tests {
         let cfg = Config::default();
         let scene = build_scene(1280, 800, &workspaces, &thumbnails, &cfg, 0xb).unwrap();
         assert_eq!(compose(&scene, 1, &cfg), compose(&scene, 1, &cfg));
+    }
+
+    /// The "+ Add Desktop" button occupies one extra, non-overlapping grid
+    /// slot appended after the real workspace cards.
+    #[test]
+    fn add_button_appends_one_non_overlapping_slot() {
+        let (workspaces, thumbnails) = fake_scene();
+        let mut cfg = Config::default();
+        cfg.behavior.show_add_desktop_button = true;
+        let scene = build_scene(1280, 800, &workspaces, &thumbnails, &cfg, 0xb).unwrap();
+
+        assert_eq!(scene.card_rects.len(), workspaces.len() + 1);
+
+        for i in 0..scene.card_rects.len() {
+            for j in (i + 1)..scene.card_rects.len() {
+                let (ax, ay, aw, ah) = scene.card_rects[i];
+                let (bx, by, bw, bh) = scene.card_rects[j];
+                let overlap = ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+                assert!(!overlap, "rects {i} and {j} overlap");
+            }
+        }
+    }
+
+    /// Disabling the flag drops the button back out of the grid entirely.
+    #[test]
+    fn add_button_disabled_by_config() {
+        let (workspaces, thumbnails) = fake_scene();
+        let mut cfg = Config::default();
+        cfg.behavior.show_add_desktop_button = false;
+        let scene = build_scene(1280, 800, &workspaces, &thumbnails, &cfg, 0xb).unwrap();
+        assert_eq!(scene.card_rects.len(), workspaces.len());
     }
 }

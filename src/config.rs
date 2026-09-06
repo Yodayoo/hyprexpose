@@ -135,6 +135,14 @@ pub struct BehaviorConfig {
     /// right-click to move the active window). Overridden by the
     /// `--allow-mouse` CLI flag when set.
     pub allow_mouse: bool,
+    /// Show a "+ Add Desktop" button as an extra grid slot, and enable the
+    /// `n` keybind. Clicking/pressing it switches to the first unused
+    /// workspace id >= `add_desktop_start_id`, which the compositor creates
+    /// empty as a side effect.
+    pub show_add_desktop_button: bool,
+    /// First workspace id considered for a new "Add Desktop" workspace. Keep
+    /// this above your highest pinned SUPER+<n> workspace number.
+    pub add_desktop_start_id: i32,
 }
 
 impl Default for BehaviorConfig {
@@ -143,6 +151,8 @@ impl Default for BehaviorConfig {
             no_preview: false,
             switch_on_move: true,
             allow_mouse: false,
+            show_add_desktop_button: true,
+            add_desktop_start_id: 11,
         }
     }
 }
